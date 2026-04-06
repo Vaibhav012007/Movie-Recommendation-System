@@ -1,20 +1,49 @@
 import fs from "fs";
 import path from "path";
+import pLimit from "p-limit";
 
-let similarityData = null;
+let recData = null;
 let moviesData = null;
+let posterCache = {}; // 🔥 cache posters
 
-// Helper to fetch TMDB poster
+// 🔥 Improved fetchPoster (timeout + retry + cache)
 const fetchPoster = async (movie_id) => {
   const api_key = "36fea595f27a3438602044b484f71df9";
-  try {
-    const res = await fetch(`https://api.themoviedb.org/3/movie/${movie_id}?api_key=${api_key}`);
-    const data = await res.json();
-    return "https://image.tmdb.org/t/p/w500" + data.poster_path;
-  } catch (error) {
-    console.error("Fetch poster error:", error);
-    return null;
-  }
+
+  // ✅ Return cached if available
+  if (posterCache[movie_id]) return posterCache[movie_id];
+
+  const url = `https://api.themoviedb.org/3/movie/${movie_id}?api_key=${api_key}`;
+
+  const tryFetch = async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (!res.ok) return null;
+
+      const data = await res.json();
+
+      if (!data.poster_path) return null;
+
+      return "https://image.tmdb.org/t/p/w500" + data.poster_path;
+
+    } catch {
+      return null;
+    }
+  };
+
+  // 🔁 Retry once
+  let poster = await tryFetch();
+  if (!poster) poster = await tryFetch();
+
+  // ✅ Save in cache (even null to avoid repeat calls)
+  posterCache[movie_id] = poster;
+
+  return poster;
 };
 
 export default async function handler(req, res) {
@@ -24,49 +53,55 @@ export default async function handler(req, res) {
 
   const { movieIndex } = req.body;
 
-  if (typeof movieIndex !== 'number') {
+  if (typeof movieIndex !== "number") {
     return res.status(400).json({ message: "Invalid movie index" });
   }
 
   try {
-    if (!similarityData) {
-      console.log("Loading similarity.json into memory...");
-      const simPath = path.join(process.cwd(), "public", "similarity.json");
-      similarityData = JSON.parse(fs.readFileSync(simPath, "utf8"));
+    // Load once
+    if (!recData) {
+      const recPath = path.join(process.cwd(), "public", "recommendations.json");
+      recData = JSON.parse(fs.readFileSync(recPath, "utf8"));
     }
-    
+
     if (!moviesData) {
-      console.log("Loading movies.json into memory...");
       const moviesPath = path.join(process.cwd(), "public", "movies.json");
       moviesData = JSON.parse(fs.readFileSync(moviesPath, "utf8"));
     }
 
-    const simRow = similarityData[movieIndex];
-    if (!simRow) {
-      return res.status(404).json({ message: "Movie data not found" });
+    const indices = recData[movieIndex];
+
+    if (!indices || !Array.isArray(indices)) {
+      return res.status(404).json({ message: "No recommendations found" });
     }
 
-    const distances = simRow
-      .map((sim, i) => [i, sim])
-      .sort((a, b) => b[1] - a[1])
-      .slice(1, 6); // Skip the first one since it's the movie itself
+    // ⚡ Parallel fetch
+    const limit = pLimit(5); // 🔥 max 5 parallel requests
 
-    let recommendations = [];
-    
-    for (let i of distances) {
-      const movie = moviesData[i[0]];
-      const poster = await fetchPoster(movie.id);
-      
-      recommendations.push({
-        title: movie.title,
-        poster: poster,
-        id: movie.id
-      });
-    }
+    const recommendations = await Promise.all(
+      indices.map((i) =>
+        limit(async () => {
+          const movie = moviesData[i];
+
+          if (!movie) {
+            return { title: "Unknown", poster: null, id: null };
+          }
+
+          const poster = await fetchPoster(movie.id);
+
+          return {
+            title: movie.title,
+            poster,
+            id: movie.id,
+          };
+        })
+      )
+    );
 
     res.status(200).json({ recommendations });
+
   } catch (error) {
-    console.error(error);
+    console.error("API error:", error);
     res.status(500).json({ message: "Internal server error" });
   }
 }
